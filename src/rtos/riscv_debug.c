@@ -129,6 +129,18 @@ static int riscv_gdb_thread_packet(struct connection *connection, const char *pa
 			return ERROR_OK;
 		}
 
+		if (strncmp(packet, "qTStatus", 8) == 0) {
+			gdb_put_packet(connection, "T0", strlen("T0"));
+			return ERROR_OK;
+		}
+
+		if (strncmp(packet, "qC", 2) == 0) {
+			char rep_str[32];
+			snprintf(rep_str, 32, "QC%d", rtos->current_threadid);
+			gdb_put_packet(connection, rep_str, strlen(rep_str));
+			return ERROR_OK;
+		}
+
 		return GDB_THREAD_PACKET_NOT_CONSUMED;
 
 	case 'Q':
@@ -248,6 +260,7 @@ static int riscv_gdb_v_packet(struct connection *connection, const char *packet,
 	if (strcmp(packet_stttrr, "vCont;c") == 0) {
 		target_call_event_callbacks(target, TARGET_EVENT_GDB_START);
 		target_call_event_callbacks(target, TARGET_EVENT_RESUME_START);
+		riscv_set_all_rtos_harts(target);
 		riscv_openocd_resume(target, 1, 0, 0, 0);
 		target->state = TARGET_RUNNING;
 		gdb_set_frontend_state_running(connection);

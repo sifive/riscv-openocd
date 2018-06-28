@@ -1718,13 +1718,38 @@ static void write_to_buf(uint8_t *buffer, uint64_t value, unsigned size)
 
 static int execute_fence(struct target *target)
 {
-	struct riscv_program program;
-	riscv_program_init(&program, target);
-	riscv_program_fence(&program);
-	int result = riscv_program_exec(&program, target);
-	if (result != ERROR_OK)
-		LOG_ERROR("Unable to execute fence");
-	return result;
+	int old_hartid = riscv_current_hartid(target);
+
+	/* FIXME: For non-coherent systems we need to flush the caches right
+	 * here, but there's no ISA-defined way of doing that. */
+	{
+		struct riscv_program program;
+		riscv_program_init(&program, target);
+		riscv_program_fence_i(&program);
+		riscv_program_fence(&program);
+		int result = riscv_program_exec(&program, target);
+		if (result != ERROR_OK)
+			LOG_DEBUG("Unable to execute pre-fence");
+	}
+
+	for (int i = 0; i < riscv_count_harts(target); ++i) {
+		if (!riscv_hart_enabled(target, i))
+			continue;
+
+		riscv_set_current_hartid(target, i);
+
+		struct riscv_program program;
+		riscv_program_init(&program, target);
+		riscv_program_fence_i(&program);
+		riscv_program_fence(&program);
+		int result = riscv_program_exec(&program, target);
+		if (result != ERROR_OK)
+			LOG_DEBUG("Unable to execute fence on hart %d", i);
+	}
+
+	riscv_set_current_hartid(target, old_hartid);
+
+	return ERROR_OK;
 }
 
 static void log_memory_access(target_addr_t address, uint64_t value,
@@ -1999,6 +2024,8 @@ static int read_memory_progbuf(struct target *target, target_addr_t address,
 
 	select_dmi(target);
 
+	memset(buffer, 0, count*size);
+
 	/* s0 holds the next address to write to
 	 * s1 holds the next data value to write
 	 */
@@ -2034,28 +2061,38 @@ static int read_memory_progbuf(struct target *target, target_addr_t address,
 		return ERROR_FAIL;
 	riscv_program_write(&program);
 
-	/* Write address to S0, and execute buffer. */
+	/* read_addr is the next address that the hart will read from, which is the
+	 * value in s0. */
+	riscv_addr_t read_addr = address;
+	/* The next address that we need to receive data for. */
+	riscv_addr_t receive_addr = address;
+	riscv_addr_t fin_addr = address + (count * size);
+
+	/* Write address to S0, and execute buffer until we end up successfully
+	 * reading an actual word from memory.  This is necessary because
+	 * Eclipse might ask us to read memory before the start of a block. */
 	result = register_write_direct(target, GDB_REGNO_S0, address);
-	if (result != ERROR_OK)
-		goto error;
 	uint32_t command = access_register_command(GDB_REGNO_S1, riscv_xlen(target),
 				AC_ACCESS_REGISTER_TRANSFER |
 				AC_ACCESS_REGISTER_POSTEXEC);
-	result = execute_abstract_command(target, command);
-	if (result != ERROR_OK)
-		goto error;
 
-	/* First read has just triggered. Result is in s1. */
+	do {
+		LOG_DEBUG("Performing first read at 0x%" PRIx64, read_addr);
+		result = register_write_direct(target, GDB_REGNO_S0, read_addr);
+		if (result != ERROR_OK)
+			goto error;
+		result = execute_abstract_command(target, command);
+		riscv013_clear_abstract_error(target);
+		read_addr += size;
+		if (result != ERROR_OK)
+			receive_addr += size;
+	} while (result != ERROR_OK && read_addr < fin_addr);
+
+	/* First valid read has just triggered. Result is in s1. */
 
 	dmi_write(target, DMI_ABSTRACTAUTO,
 			1 << DMI_ABSTRACTAUTO_AUTOEXECDATA_OFFSET);
 
-	/* read_addr is the next address that the hart will read from, which is the
-	 * value in s0. */
-	riscv_addr_t read_addr = address + size;
-	/* The next address that we need to receive data for. */
-	riscv_addr_t receive_addr = address;
-	riscv_addr_t fin_addr = address + (count * size);
 	unsigned skip = 1;
 	while (read_addr < fin_addr) {
 		LOG_DEBUG("read_addr=0x%" PRIx64 ", receive_addr=0x%" PRIx64
@@ -2161,11 +2198,22 @@ static int read_memory_progbuf(struct target *target, target_addr_t address,
 						1 << DMI_ABSTRACTAUTO_AUTOEXECDATA_OFFSET);
 				break;
 			default:
-				LOG_ERROR("error when reading memory, abstractcs=0x%08lx", (long)abstractcs);
+				LOG_DEBUG("error when reading memory, abstractcs=0x%08lx", (long)abstractcs);
 				riscv013_clear_abstract_error(target);
 				riscv_batch_free(batch);
 				result = ERROR_FAIL;
-				goto error;
+				/* Eclipse attempts to pre-buffer some data
+				 * before an address, so here we retry on
+				 * failing reads by just moving on to the next
+				 * address. */
+				dmi_write(target, DMI_ABSTRACTAUTO, 0);
+				next_read_addr = read_addr + size;
+				if (register_write_direct(target, GDB_REGNO_S0, next_read_addr) != ERROR_OK)
+					goto error;
+				dmi_write(target, DMI_COMMAND, command);
+				dmi_write(target, DMI_ABSTRACTAUTO,
+						1 << DMI_ABSTRACTAUTO_AUTOEXECDATA_OFFSET);
+				break;
 		}
 
 		/* Now read whatever we got out of the batch. */
@@ -2899,19 +2947,7 @@ int riscv013_dmi_write_u64_bits(struct target *target)
 
 static int maybe_execute_fence_i(struct target *target)
 {
-	RISCV013_INFO(info);
-	RISCV_INFO(r);
-	if (info->progbufsize + r->impebreak >= 2) {
-		struct riscv_program program;
-		riscv_program_init(&program, target);
-		if (riscv_program_fence_i(&program) != ERROR_OK)
-			return ERROR_FAIL;
-		if (riscv_program_exec(&program, target) != ERROR_OK) {
-			LOG_ERROR("Failed to execute fence.i");
-			return ERROR_FAIL;
-		}
-	}
-	return ERROR_OK;
+	return execute_fence(target);
 }
 
 /* Helper Functions. */

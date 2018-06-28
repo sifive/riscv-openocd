@@ -96,7 +96,7 @@ struct gdb_connection {
 	char *thread_list;
 };
 
-#if 0
+#if 1
 #define _DEBUG_GDB_IO_
 #endif
 
@@ -779,6 +779,10 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 		gdb_connection->ctrl_c = 0;
 	}
 
+	char sig_reply_str[46];
+	memset(sig_reply_str, '\0', 46);
+	strncpy(sig_reply_str, sig_reply, 46);
+	LOG_DEBUG("signal reply: %s", sig_reply_str);
 	gdb_put_packet(connection, sig_reply, sig_reply_len);
 	gdb_connection->frontend_state = TARGET_HALTED;
 }
