@@ -42,6 +42,10 @@
 	((elf->endianness == ELFDATA2LSB) ? \
 	le_to_h_u32((uint8_t *)&field) : be_to_h_u32((uint8_t *)&field))
 
+#define field64(elf, field) \
+	((elf->endianness == ELFDATA2LSB) ? \
+	le_to_h_u64((uint8_t *)&field) : be_to_h_u64((uint8_t *)&field))
+
 static int autodetect_image_type(struct image *image, const char *url)
 {
 	int retval;
@@ -350,13 +354,14 @@ static int image_ihex_buffer_complete(struct image *image)
 	return retval;
 }
 
+static int image_elf_read_headers_32(struct image *image);
+static int image_elf_read_headers_64(struct image *image);
+
 static int image_elf_read_headers(struct image *image)
 {
-	struct image_elf *elf = image->type_private;
+	struct image_elf32 *elf = image->type_private;
 	size_t read_bytes;
-	uint32_t i, j;
 	int retval;
-	uint32_t nload, load_to_vaddr = 0;
 
 	elf->header = malloc(sizeof(Elf32_Ehdr));
 
@@ -379,25 +384,73 @@ static int image_elf_read_headers(struct image *image)
 		LOG_ERROR("invalid ELF file, bad magic number");
 		return ERROR_IMAGE_FORMAT_ERROR;
 	}
-	if (elf->header->e_ident[EI_CLASS] != ELFCLASS32) {
-		LOG_ERROR("invalid ELF file, only 32bits files are supported");
-		return ERROR_IMAGE_FORMAT_ERROR;
+
+	if (elf->header->e_ident[EI_CLASS] == ELFCLASS64) {
+		LOG_ERROR("magic number %02x:%02x:%02x:%02x",
+			          elf->header->e_ident[0],
+					  elf->header->e_ident[1],
+					  elf->header->e_ident[2],
+					  elf->header->e_ident[3]);
+		free(elf->header);
+
+		retval = fileio_seek(elf->fileio, 0);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("cannot seek to ELF header, read failed");
+			return retval;
+		}
+
+		struct image_elf64 *elf64 = image->type_private;
+		elf64->header = malloc(sizeof(Elf64_Ehdr));
+
+		retval = fileio_read(elf64->fileio, sizeof(Elf64_Ehdr), (uint8_t *)elf64->header, &read_bytes);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("cannot read ELF file header, read failed");
+			return ERROR_FILEIO_OPERATION_FAILED;
+		}
+		if (read_bytes != sizeof(Elf64_Ehdr)) {
+			LOG_ERROR("cannot read ELF file header, only partially read");
+			return ERROR_FILEIO_OPERATION_FAILED;
+		}
+		if (strncmp((char *)elf64->header->e_ident, ELFMAG, SELFMAG) != 0) {
+			LOG_ERROR("invalid ELF file, bad magic number");
+			return ERROR_IMAGE_FORMAT_ERROR;
+		}
+		return image_elf_read_headers_64(image);
+	} else if (elf->header->e_ident[EI_CLASS] == ELFCLASS32) {
+		if (read_bytes != sizeof(Elf32_Ehdr)) {
+			LOG_ERROR("cannot read ELF file header, only partially read");
+			return ERROR_FILEIO_OPERATION_FAILED;
+		}
+		return image_elf_read_headers_32(image);
 	}
 
-	elf->endianness = elf->header->e_ident[EI_DATA];
+	LOG_ERROR("invalid ELF file, only 32bits and 64bits files are supported");
+	return ERROR_IMAGE_FORMAT_ERROR;
+}
+
+static int image_elf_read_headers_32(struct image *image)
+{
+	struct image_elf32 *elf = image->type_private;
+	Elf32_Ehdr * header = elf->header;
+	size_t read_bytes;
+	uint32_t i, j;
+	int retval;
+	uint32_t nload, load_to_vaddr = 0;
+
+	elf->endianness = header->e_ident[EI_DATA];
 	if ((elf->endianness != ELFDATA2LSB)
 		&& (elf->endianness != ELFDATA2MSB)) {
 		LOG_ERROR("invalid ELF file, unknown endianness setting");
 		return ERROR_IMAGE_FORMAT_ERROR;
 	}
 
-	elf->segment_count = field16(elf, elf->header->e_phnum);
+	elf->segment_count = field16(elf, header->e_phnum);
 	if (elf->segment_count == 0) {
 		LOG_ERROR("invalid ELF file, no program headers");
 		return ERROR_IMAGE_FORMAT_ERROR;
 	}
 
-	retval = fileio_seek(elf->fileio, field32(elf, elf->header->e_phoff));
+	retval = fileio_seek(elf->fileio, field32(elf, header->e_phoff));
 	if (retval != ERROR_OK) {
 		LOG_ERROR("cannot seek to ELF program header table, read failed");
 		return retval;
@@ -471,19 +524,120 @@ static int image_elf_read_headers(struct image *image)
 	}
 
 	image->start_address_set = true;
-	image->start_address = field32(elf, elf->header->e_entry);
+	image->start_address = field32(elf, header->e_entry);
 
 	return ERROR_OK;
 }
 
-static int image_elf_read_section(struct image *image,
+static int image_elf_read_headers_64(struct image *image)
+{
+	struct image_elf64 *elf = image->type_private;
+	Elf64_Ehdr * header = elf->header;
+	size_t read_bytes;
+	uint32_t i, j;
+	int retval;
+	uint32_t nload, load_to_vaddr = 0;
+
+	elf->endianness = header->e_ident[EI_DATA];
+	if ((elf->endianness != ELFDATA2LSB)
+		&& (elf->endianness != ELFDATA2MSB)) {
+		LOG_ERROR("invalid ELF file, unknown endianness setting");
+		return ERROR_IMAGE_FORMAT_ERROR;
+	}
+
+	elf->segment_count = field16(elf, header->e_phnum);
+	if (elf->segment_count == 0) {
+		LOG_ERROR("invalid ELF file, no program headers");
+		return ERROR_IMAGE_FORMAT_ERROR;
+	}
+
+	retval = fileio_seek(elf->fileio, field64(elf, header->e_phoff));
+	if (retval != ERROR_OK) {
+		LOG_ERROR("cannot seek to ELF program header table, read failed");
+		return retval;
+	}
+
+	elf->segments = malloc(elf->segment_count*sizeof(Elf64_Phdr));
+	if (elf->segments == NULL) {
+		LOG_ERROR("insufficient memory to perform operation ");
+		return ERROR_FILEIO_OPERATION_FAILED;
+	}
+
+	retval = fileio_read(elf->fileio, elf->segment_count*sizeof(Elf64_Phdr),
+			(uint8_t *)elf->segments, &read_bytes);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("cannot read ELF segment headers, read failed");
+		return retval;
+	}
+	if (read_bytes != elf->segment_count*sizeof(Elf64_Phdr)) {
+		LOG_ERROR("cannot read ELF segment headers, only partially read");
+		return ERROR_FILEIO_OPERATION_FAILED;
+	}
+
+	/* count useful segments (loadable), ignore BSS section */
+	image->num_sections = 0;
+	for (i = 0; i < elf->segment_count; i++)
+		if ((field32(elf,
+			elf->segments[i].p_type) == PT_LOAD) &&
+			(field64(elf, elf->segments[i].p_filesz) != 0))
+			image->num_sections++;
+
+	assert(image->num_sections > 0);
+
+	/**
+	 * some ELF linkers produce binaries with *all* the program header
+	 * p_paddr fields zero (there can be however one loadable segment
+	 * that has valid physical address 0x0).
+	 * If we have such a binary with more than
+	 * one PT_LOAD header, then use p_vaddr instead of p_paddr
+	 * (ARM ELF standard demands p_paddr = 0 anyway, and BFD
+	 * library uses this approach to workaround zero-initialized p_paddrs
+	 * when obtaining lma - look at elf.c of BDF)
+	 */
+	for (nload = 0, i = 0; i < elf->segment_count; i++)
+		if (elf->segments[i].p_paddr != 0)
+			break;
+		else if ((field32(elf,
+			elf->segments[i].p_type) == PT_LOAD) &&
+			(field64(elf, elf->segments[i].p_memsz) != 0))
+			++nload;
+
+	if (i >= elf->segment_count && nload > 1)
+		load_to_vaddr = 1;
+
+	/* alloc and fill sections array with loadable segments */
+	image->sections = malloc(image->num_sections * sizeof(struct imagesection));
+	for (i = 0, j = 0; i < elf->segment_count; i++) {
+		if ((field32(elf,
+			elf->segments[i].p_type) == PT_LOAD) &&
+			(field64(elf, elf->segments[i].p_filesz) != 0)) {
+			image->sections[j].size = field64(elf, elf->segments[i].p_filesz);
+			if (load_to_vaddr)
+				image->sections[j].base_address = field64(elf,
+						elf->segments[i].p_vaddr);
+			else
+				image->sections[j].base_address = field64(elf,
+						elf->segments[i].p_paddr);
+			image->sections[j].private = &elf->segments[i];
+			image->sections[j].flags = field32(elf, elf->segments[i].p_flags);
+			j++;
+		}
+	}
+
+	image->start_address_set = true;
+	image->start_address = field64(elf, header->e_entry);
+
+	return ERROR_OK;
+}
+
+static int image_elf_read_section32(struct image *image,
 	int section,
 	uint32_t offset,
 	uint32_t size,
 	uint8_t *buffer,
 	size_t *size_read)
 {
-	struct image_elf *elf = image->type_private;
+	struct image_elf32 *elf = image->type_private;
 	Elf32_Phdr *segment = (Elf32_Phdr *)image->sections[section].private;
 	size_t read_size, really_read;
 	int retval;
@@ -500,6 +654,49 @@ static int image_elf_read_section(struct image *image,
 			field32(elf, segment->p_offset) + offset);
 		/* read initialized area of the segment */
 		retval = fileio_seek(elf->fileio, field32(elf, segment->p_offset) + offset);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("cannot find ELF segment content, seek failed");
+			return retval;
+		}
+		retval = fileio_read(elf->fileio, read_size, buffer, &really_read);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("cannot read ELF segment content, read failed");
+			return retval;
+		}
+		size -= read_size;
+		*size_read += read_size;
+		/* need more data ? */
+		if (!size)
+			return ERROR_OK;
+	}
+
+	return ERROR_OK;
+}
+
+static int image_elf_read_section64(struct image *image,
+	int section,
+	uint32_t offset,
+	uint32_t size,
+	uint8_t *buffer,
+	size_t *size_read)
+{
+	struct image_elf64 *elf = image->type_private;
+	Elf64_Phdr *segment = (Elf64_Phdr *)image->sections[section].private;
+	size_t read_size, really_read;
+	int retval;
+
+	*size_read = 0;
+
+	LOG_DEBUG("load segment %d at 0x%" PRIx32 " (sz = 0x%" PRIx32 ")", section, offset, size);
+
+	/* read initialized data in current segment if any */
+	if (offset < field64(elf, segment->p_filesz)) {
+		/* maximal size present in file for the current segment */
+		read_size = MIN(size, field64(elf, segment->p_filesz) - offset);
+		LOG_DEBUG("read elf: size = 0x%zx at 0x%" PRIx64 "", read_size,
+			field64(elf, segment->p_offset) + offset);
+		/* read initialized area of the segment */
+		retval = fileio_seek(elf->fileio, field64(elf, segment->p_offset) + offset);
 		if (retval != ERROR_OK) {
 			LOG_ERROR("cannot find ELF segment content, seek failed");
 			return retval;
@@ -767,9 +964,9 @@ int image_open(struct image *image, const char *url, const char *type_string)
 			return retval;
 		}
 	} else if (image->type == IMAGE_ELF) {
-		struct image_elf *image_elf;
+		struct image_elf32 *image_elf;
 
-		image_elf = image->type_private = malloc(sizeof(struct image_elf));
+		image_elf = image->type_private = malloc(MAX(sizeof(struct image_elf32), sizeof(struct image_elf64)));
 
 		retval = fileio_open(&image_elf->fileio, url, FILEIO_READ, FILEIO_BINARY);
 		if (retval != ERROR_OK)
@@ -878,8 +1075,14 @@ int image_read_section(struct image *image,
 		*size_read = size;
 
 		return ERROR_OK;
-	} else if (image->type == IMAGE_ELF)
-		return image_elf_read_section(image, section, offset, size, buffer, size_read);
+	} else if (image->type == IMAGE_ELF) {
+		struct image_elf32 *elf = image->type_private;
+		if ( elf->header->e_ident[EI_CLASS] == ELFCLASS64 ) {
+			return image_elf_read_section64(image, section, offset, size, buffer, size_read);
+		} else {
+			return image_elf_read_section32(image, section, offset, size, buffer, size_read);
+		}
+	}
 	else if (image->type == IMAGE_MEMORY) {
 		struct image_memory *image_memory = image->type_private;
 		uint32_t address = image->sections[section].base_address + offset;
@@ -984,7 +1187,7 @@ void image_close(struct image *image)
 		free(image_ihex->buffer);
 		image_ihex->buffer = NULL;
 	} else if (image->type == IMAGE_ELF) {
-		struct image_elf *image_elf = image->type_private;
+		struct image_elf32 *image_elf = image->type_private;
 
 		fileio_close(image_elf->fileio);
 

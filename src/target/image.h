@@ -78,10 +78,18 @@ struct image_memory {
 	uint32_t cache_address;
 };
 
-struct image_elf {
+struct image_elf32 {
 	struct fileio *fileio;
 	Elf32_Ehdr *header;
 	Elf32_Phdr *segments;
+	uint32_t segment_count;
+	uint8_t endianness;
+};
+
+struct image_elf64 {
+	struct fileio *fileio;
+	Elf64_Ehdr *header;
+	Elf64_Phdr *segments;
 	uint32_t segment_count;
 	uint8_t endianness;
 };
